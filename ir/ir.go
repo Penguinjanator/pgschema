@@ -80,6 +80,9 @@ type Table struct {
 	// child DEFAULT/NOT NULL overrides without managing or fingerprinting the
 	// parent itself.
 	PartitionParentColumns []*Column `json:"-"`
+	// AllPartitionChildren records catalog children, including ignored or external
+	// tables. Creation planning uses this metadata to identify complete hierarchies.
+	AllPartitionChildren []TableDependency `json:"-"`
 }
 
 // Column represents a table column
@@ -243,6 +246,9 @@ type Sequence struct {
 
 // Constraint represents a table constraint
 type Constraint struct {
+	// BackingIndex identifies the index created by this constraint. Inspection
+	// records it for attached indexes; it does not change constraint generation.
+	BackingIndex        *IndexRef           `json:"-"`
 	Schema              string              `json:"schema"`
 	Table               string              `json:"table"`
 	Name                string              `json:"name"`
@@ -282,6 +288,12 @@ const (
 	ConstraintTypeExclusion  ConstraintType = "EXCLUSION"
 )
 
+// IndexRef identifies an index within a schema.
+type IndexRef struct {
+	Schema string
+	Name   string
+}
+
 // Index represents a database index
 type Index struct {
 	Schema            string         `json:"schema"`
@@ -296,8 +308,14 @@ type Index struct {
 	Where             string         `json:"where,omitempty"`              // partial index condition
 	NullsNotDistinct  bool           `json:"nulls_not_distinct,omitempty"` // NULLS NOT DISTINCT (PG15+)
 	IsPartitioned     bool           `json:"is_partitioned,omitempty"`     // index target is a partitioned parent (relkind 'p')
+	ParentIndex       string         `json:"parent_index,omitempty"`       // attached parent index, empty for unattached indexes
+	ParentIndexSchema string         `json:"parent_index_schema,omitempty"`
 	StorageParameters []string       `json:"storage_parameters,omitempty"` // WITH (fillfactor=100, ...)
 	Comment           string         `json:"comment,omitempty"`
+	// AttachedPartitions records catalog attachments, including ignored children.
+	// Dump validation uses it to detect excluded dependencies. It is inspection
+	// metadata, not part of the managed schema or its fingerprint.
+	AttachedPartitions []IndexRef `json:"-"`
 }
 
 // IndexColumn represents a column within an index

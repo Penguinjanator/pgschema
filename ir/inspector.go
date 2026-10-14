@@ -752,6 +752,13 @@ func (i *Inspector) populatePartitionChildMetadata(ctx context.Context, schema *
 	dbSchema := schema.getOrCreateSchema(targetSchema)
 
 	for _, child := range partitionChildren {
+		if child.ParentSchema == targetSchema {
+			if parent := dbSchema.Tables[child.ParentTable]; parent != nil {
+				parent.AllPartitionChildren = append(parent.AllPartitionChildren, TableDependency{
+					Schema: child.ChildSchema, Name: child.ChildTable, Type: DependencyTypeTable,
+				})
+			}
+		}
 		// Only process children in the target schema
 		if child.ChildSchema != targetSchema {
 			continue
@@ -811,6 +818,13 @@ func (i *Inspector) buildIndexes(ctx context.Context, schema *IR, targetSchema s
 		return err
 	}
 
+	// Read all attachment edges, including children owned by constraints and
+	// excluded objects. The managed-index query deliberately omits those rows.
+	attachedPartitions, err := i.buildIndexAttachments(ctx, schema, targetSchema)
+	if err != nil {
+		return err
+	}
+
 	for _, indexRow := range indexes {
 		schemaName := indexRow.Schemaname
 		tableName := indexRow.Tablename
@@ -845,18 +859,21 @@ func (i *Inspector) buildIndexes(ctx context.Context, schema *IR, targetSchema s
 		}
 
 		index := &Index{
-			Schema:            schemaName,
-			Table:             tableName,
-			Name:              indexName,
-			Type:              indexType,
-			Method:            method,
-			IncludeColumns:    indexRow.IncludeColumns,
-			IsPartial:         isPartial,
-			IsExpression:      hasExpressions,
-			Where:             "",
-			StorageParameters: indexRow.Reloptions,
-			Comment:           comment,
-			Columns:           []*IndexColumn{},
+			Schema:             schemaName,
+			Table:              tableName,
+			Name:               indexName,
+			Type:               indexType,
+			Method:             method,
+			IncludeColumns:     indexRow.IncludeColumns,
+			IsPartial:          isPartial,
+			IsExpression:       hasExpressions,
+			Where:              "",
+			StorageParameters:  indexRow.Reloptions,
+			ParentIndex:        indexRow.ParentIndex.String,
+			ParentIndexSchema:  indexRow.ParentIndexSchema.String,
+			AttachedPartitions: attachedPartitions[IndexRef{Schema: schemaName, Name: indexName}],
+			Comment:            comment,
+			Columns:            []*IndexColumn{},
 		}
 
 		// Check for NULLS NOT DISTINCT (PostgreSQL 15+)

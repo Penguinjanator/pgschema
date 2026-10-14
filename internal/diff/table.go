@@ -487,6 +487,7 @@ func generateCreateTablesSQL(
 	shouldDeferPolicy func(*ir.RLSPolicy) bool,
 	suppressedInlineFKs map[string]bool,
 	allNewTables map[string]*ir.Table,
+	partitionIndexes *partitionIndexCreationPlan,
 ) ([]*ir.RLSPolicy, []*deferredConstraint) {
 	var deferredPolicies []*ir.RLSPolicy
 	var deferredConstraints []*deferredConstraint
@@ -495,7 +496,7 @@ func generateCreateTablesSQL(
 	// Process tables in the provided order (already topologically sorted)
 	for _, table := range tables {
 		// Create the table, deferring FK constraints that reference not-yet-created tables
-		sql, tableDeferred := generateTableSQL(table, targetSchema, collector.qualifySchema, createdTables, existingTables, suppressedInlineFKs, allNewTables)
+		sql, tableDeferred := generateTableSQL(table, targetSchema, collector.qualifySchema, createdTables, existingTables, suppressedInlineFKs, allNewTables, partitionIndexes)
 		deferredConstraints = append(deferredConstraints, tableDeferred...)
 
 		// Create context for this statement
@@ -548,7 +549,9 @@ func generateCreateTablesSQL(
 		// Convert map to slice for indexes
 		indexes := make([]*ir.Index, 0, len(table.Indexes))
 		for _, index := range table.Indexes {
-			indexes = append(indexes, index)
+			if !partitionIndexes.contains(index) {
+				indexes = append(indexes, index)
+			}
 		}
 		generateCreateIndexesSQL(indexes, targetSchema, collector)
 
@@ -917,10 +920,15 @@ func generateDropTablesSQL(tables []*ir.Table, targetSchema string, collector *d
 }
 
 // generateTableSQL generates CREATE TABLE statement and returns any deferred FK constraints
-func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, createdTables map[string]bool, existingTables map[string]bool, suppressedInlineFKs map[string]bool, allTables map[string]*ir.Table) (string, []*deferredConstraint) {
+func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, createdTables map[string]bool, existingTables map[string]bool, suppressedInlineFKs map[string]bool, allTables map[string]*ir.Table, partitionIndexes *partitionIndexCreationPlan) (string, []*deferredConstraint) {
 	// Only include table name without schema if it's in the target schema (unless
 	// forced qualification is on).
 	tableName := ir.QualifyEntityNameWithQuotesMode(table.Schema, table.Name, targetSchema, qualifySchema)
+
+	partitionClause := ""
+	if table.IsPartitioned && table.PartitionStrategy != "" && table.PartitionKey != "" {
+		partitionClause = fmt.Sprintf(" PARTITION BY %s (%s)", table.PartitionStrategy, table.PartitionKey)
+	}
 
 	// Partition children: emit PARTITION OF instead of standalone CREATE TABLE.
 	// Columns and inherited constraints come from the parent automatically;
@@ -982,7 +990,8 @@ func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, 
 			if suppressedInlineFKs[constraintPathKey(constraint)] {
 				continue
 			}
-			if shouldDeferConstraint(table, constraint, currentKey, createdTables, existingTables) {
+			if shouldDeferConstraint(table, constraint, currentKey, createdTables, existingTables) ||
+				partitionIndexes.defersForeignKey(table, constraint) {
 				deferred = append(deferred, &deferredConstraint{
 					table:      table,
 					constraint: constraint,
@@ -1002,10 +1011,10 @@ func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, 
 		allParts := append(elementParts, constraintParts...)
 		var sql string
 		if len(allParts) > 0 {
-			sql = fmt.Sprintf("%s %s PARTITION OF %s (\n%s\n) %s;",
-				createPrefix, tableName, parentName, strings.Join(allParts, ",\n"), table.PartitionBound)
+			sql = fmt.Sprintf("%s %s PARTITION OF %s (\n%s\n) %s%s;",
+				createPrefix, tableName, parentName, strings.Join(allParts, ",\n"), table.PartitionBound, partitionClause)
 		} else {
-			sql = fmt.Sprintf("%s %s PARTITION OF %s %s;", createPrefix, tableName, parentName, table.PartitionBound)
+			sql = fmt.Sprintf("%s %s PARTITION OF %s %s%s;", createPrefix, tableName, parentName, table.PartitionBound, partitionClause)
 		}
 		return sql, deferred
 	}
@@ -1046,7 +1055,8 @@ func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, 
 		if suppressedInlineFKs[constraintPathKey(constraint)] {
 			continue
 		}
-		if shouldDeferConstraint(table, constraint, currentKey, createdTables, existingTables) {
+		if shouldDeferConstraint(table, constraint, currentKey, createdTables, existingTables) ||
+			partitionIndexes.defersForeignKey(table, constraint) {
 			deferred = append(deferred, &deferredConstraint{
 				table:      table,
 				constraint: constraint,
@@ -1061,12 +1071,7 @@ func generateTableSQL(table *ir.Table, targetSchema string, qualifySchema bool, 
 
 	parts = append(parts, strings.Join(columnParts, ",\n"))
 
-	// Add partition clause for partitioned tables
-	if table.IsPartitioned && table.PartitionStrategy != "" && table.PartitionKey != "" {
-		parts = append(parts, fmt.Sprintf(") PARTITION BY %s (%s);", table.PartitionStrategy, table.PartitionKey))
-	} else {
-		parts = append(parts, ");")
-	}
+	parts = append(parts, ")"+partitionClause+";")
 
 	return strings.Join(parts, "\n"), deferred
 }

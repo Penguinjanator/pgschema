@@ -527,6 +527,9 @@ func normalizeSchemaNames(irData *ir.IR, fromSchema, toSchema string) {
 
 			// Normalize constraint schemas
 			for _, constraint := range table.Constraints {
+				if constraint.BackingIndex != nil && constraint.BackingIndex.Schema == fromSchema {
+					constraint.BackingIndex.Schema = toSchema
+				}
 				// Normalize the constraint's own schema field
 				if constraint.Schema == fromSchema {
 					constraint.Schema = toSchema
@@ -579,10 +582,24 @@ func normalizeSchemaNames(irData *ir.IR, fromSchema, toSchema string) {
 				}
 			}
 
+			for j := range table.AllPartitionChildren {
+				if table.AllPartitionChildren[j].Schema == fromSchema {
+					table.AllPartitionChildren[j].Schema = toSchema
+				}
+			}
+
 			// Normalize schema names in indexes
 			for _, index := range table.Indexes {
 				if index.Schema == fromSchema {
 					index.Schema = toSchema
+				}
+				if index.ParentIndexSchema == fromSchema {
+					index.ParentIndexSchema = toSchema
+				}
+				for j := range index.AttachedPartitions {
+					if index.AttachedPartitions[j].Schema == fromSchema {
+						index.AttachedPartitions[j].Schema = toSchema
+					}
 				}
 				index.Where = stripQualifiers(replaceString(index.Where))
 				if index.IsExpression {

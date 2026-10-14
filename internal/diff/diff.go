@@ -199,6 +199,8 @@ const (
 	// for dependency handling. The object will be recreated, so this should be
 	// counted as a modification in summaries, not a destruction.
 	DiffOperationRecreate
+	// DiffOperationAttach indicates an explicit partition index attachment.
+	DiffOperationAttach
 )
 
 // String returns the string representation of DiffOperation
@@ -212,6 +214,8 @@ func (d DiffOperation) String() string {
 		return "drop"
 	case DiffOperationRecreate:
 		return "recreate"
+	case DiffOperationAttach:
+		return "attach"
 	default:
 		return "unknown"
 	}
@@ -238,6 +242,8 @@ func (d *DiffOperation) UnmarshalJSON(data []byte) error {
 		*d = DiffOperationDrop
 	case "recreate":
 		*d = DiffOperationRecreate
+	case "attach":
+		*d = DiffOperationAttach
 	default:
 		return fmt.Errorf("unknown diff operation: %s", s)
 	}
@@ -278,6 +284,7 @@ type ddlDiff struct {
 	droppedTables             []*ir.Table
 	modifiedTables            []*tableDiff
 	allNewTables              map[string]*ir.Table
+	partitionIndexes          *partitionIndexCreationPlan
 	addedViews                []*ir.View
 	droppedViews              []*ir.View
 	modifiedViews             []*viewDiff
@@ -484,7 +491,7 @@ type rlsChange struct {
 // GenerateMigration generates the migration diff using standard "smart qualification"
 // (the target-schema prefix is omitted on entity names).
 func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
-	return generateMigration(oldIR, newIR, targetSchema, false, 0)
+	return generateMigration(oldIR, newIR, targetSchema, false, 0, false)
 }
 
 // GenerateMigrationForTarget is GenerateMigration for a target database whose
@@ -493,7 +500,7 @@ func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
 // ALTER COLUMN ... SET EXPRESSION AS (PostgreSQL 17+); older targets get a
 // version-portable equivalent instead (issue #591).
 func GenerateMigrationForTarget(oldIR, newIR *ir.IR, targetSchema string, targetMajorVersion int) []Diff {
-	return generateMigration(oldIR, newIR, targetSchema, false, targetMajorVersion)
+	return generateMigration(oldIR, newIR, targetSchema, false, targetMajorVersion, false)
 }
 
 // GenerateMigrationWithOptions is like GenerateMigration, but when qualifySchema is
@@ -506,10 +513,19 @@ func GenerateMigrationForTarget(oldIR, newIR *ir.IR, targetSchema string, target
 // stay bare because the IR stores them without schema identity (#493). Default
 // behavior (false) is unchanged for plan/apply.
 func GenerateMigrationWithOptions(oldIR, newIR *ir.IR, targetSchema string, qualifySchema bool) []Diff {
-	return generateMigration(oldIR, newIR, targetSchema, qualifySchema, 0)
+	return generateMigration(oldIR, newIR, targetSchema, qualifySchema, 0, false)
 }
 
-func generateMigration(oldIR, newIR *ir.IR, targetSchema string, qualifySchema bool, targetMajorVersion int) []Diff {
+// GenerateDump creates an empty-to-target export while preserving partitioned
+// index identities. Migrations use the same schedule for complete new hierarchies.
+func GenerateDump(schema *ir.IR, targetSchema string, qualifySchema bool) ([]Diff, error) {
+	if err := validatePartitionIndexDependencies(schema); err != nil {
+		return nil, err
+	}
+	return generateMigration(ir.NewIR(), schema, targetSchema, qualifySchema, 0, true), nil
+}
+
+func generateMigration(oldIR, newIR *ir.IR, targetSchema string, qualifySchema bool, targetMajorVersion int, dump bool) []Diff {
 	diff := &ddlDiff{
 		targetMajorVersion:         targetMajorVersion,
 		addedSchemas:               []*ir.Schema{},
@@ -1634,6 +1650,7 @@ func generateMigration(oldIR, newIR *ir.IR, targetSchema string, qualifySchema b
 	// Create a diffCollector and generate SQL
 	collector := newDiffCollector()
 	collector.qualifySchema = qualifySchema
+	diff.partitionIndexes = planPartitionIndexCreation(diff.addedTables, newTables, dump)
 	diff.collectMigrationSQL(targetSchema, collector)
 	return collector.diffs
 }
@@ -2014,7 +2031,7 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	}
 
 	// Create tables WITHOUT function/domain dependencies first (functions may reference these)
-	deferredPolicies1, deferredConstraints1 := generateCreateTablesSQL(tablesWithoutDeps, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs, d.allNewTables)
+	deferredPolicies1, deferredConstraints1 := generateCreateTablesSQL(tablesWithoutDeps, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs, d.allNewTables, d.partitionIndexes)
 
 	// Build view lookup - needed for detecting functions that depend on views
 	newViewLookup := buildViewLookup(d.addedViews)
@@ -2113,7 +2130,7 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	generateCreateProceduresSQL(d.addedProcedures, targetSchema, collector)
 
 	// Create tables WITH function/domain dependencies (now that functions and deferred domains exist)
-	deferredPolicies2, deferredConstraints2 := generateCreateTablesSQL(tablesWithDeps, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs, d.allNewTables)
+	deferredPolicies2, deferredConstraints2 := generateCreateTablesSQL(tablesWithDeps, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs, d.allNewTables, d.partitionIndexes)
 
 	// Create functions WITHOUT view deps that reference new tables (now that all tables exist)
 	// These functions query tables that were created in tablesWithDeps above (issue #530)
@@ -2125,7 +2142,7 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	generateCreateTypesSQL(domainsWithTableDeps, targetSchema, collector)
 
 	// Create tables that use table-dep domains as column types (now that those domains exist).
-	deferredPolicies3, deferredConstraints3 := generateCreateTablesSQL(tablesAfterTableDomains, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs, d.allNewTables)
+	deferredPolicies3, deferredConstraints3 := generateCreateTablesSQL(tablesAfterTableDomains, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs, d.allNewTables, d.partitionIndexes)
 
 	// Create functions that reference tables in the last table batch above.
 	generateCreateFunctionsSQL(functionsAfterAllTables, targetSchema, collector)
@@ -2135,6 +2152,8 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	for _, seq := range d.addedSerialSeqComments {
 		generateSequenceComment(seq, targetSchema, DiffOperationCreate, collector)
 	}
+
+	d.partitionIndexes.generateSQL(targetSchema, collector)
 
 	// Add deferred foreign key constraints from ALL batches AFTER all tables are created
 	// This ensures FK references to tables in any batch work correctly
