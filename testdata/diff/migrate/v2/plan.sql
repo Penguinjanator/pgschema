@@ -44,9 +44,11 @@ SELECT
         ELSE 0
     END as progress
 FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
 LEFT JOIN pg_index i ON c.oid = i.indexrelid
 LEFT JOIN pg_stat_progress_create_index p ON c.oid = p.index_relid
-WHERE c.relname = 'idx_employee_hire_date';
+WHERE c.relname = 'idx_employee_hire_date'
+  AND n.nspname = 'public';
 
 ALTER TABLE salary DROP CONSTRAINT salary_emp_no_fkey;
 
@@ -65,9 +67,11 @@ SELECT
         ELSE 0
     END as progress
 FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
 LEFT JOIN pg_index i ON c.oid = i.indexrelid
 LEFT JOIN pg_stat_progress_create_index p ON c.oid = p.index_relid
-WHERE c.relname = 'idx_salary_amount';
+WHERE c.relname = 'idx_salary_amount'
+  AND n.nspname = 'public';
 
 ALTER TABLE title DROP CONSTRAINT title_emp_no_fkey;
 

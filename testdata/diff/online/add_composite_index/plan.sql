@@ -8,9 +8,11 @@ SELECT
         ELSE 0
     END as progress
 FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
 LEFT JOIN pg_index i ON c.oid = i.indexrelid
 LEFT JOIN pg_stat_progress_create_index p ON c.oid = p.index_relid
-WHERE c.relname = 'idx_users_email_include';
+WHERE c.relname = 'idx_users_email_include'
+  AND n.nspname = 'public';
 
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email_status ON users (email, status DESC);
 
@@ -22,6 +24,8 @@ SELECT
         ELSE 0
     END as progress
 FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
 LEFT JOIN pg_index i ON c.oid = i.indexrelid
 LEFT JOIN pg_stat_progress_create_index p ON c.oid = p.index_relid
-WHERE c.relname = 'idx_users_email_status';
+WHERE c.relname = 'idx_users_email_status'
+  AND n.nspname = 'public';

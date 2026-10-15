@@ -215,3 +215,73 @@ func TestPendingNotNullValidateIsolated(t *testing.T) {
 		t.Errorf("isolated step SQL = %q, want %q", got, validate.Statements[0].SQL)
 	}
 }
+
+// TestGenerateIndexWaitQuerySchemaQualified verifies the wait query for
+// CREATE INDEX CONCURRENTLY is limited to the target schema (issue #641).
+// Without the namespace filter, an invalid index of the same name in another
+// schema makes apply hang forever because checkWaitStatus reads the first row.
+func TestGenerateIndexWaitQuerySchemaQualified(t *testing.T) {
+	sql := generateIndexWaitQueryWithName("tenant_b", "items_sku_idx")
+	if !strings.Contains(sql, "c.relname = 'items_sku_idx'") {
+		t.Fatalf("wait query missing index name filter:\n%s", sql)
+	}
+	if !strings.Contains(sql, "n.nspname = 'tenant_b'") {
+		t.Fatalf("wait query missing schema qualification (issue #641):\n%s", sql)
+	}
+}
+
+// TestGenerateIndexRewriteWaitIsSchemaQualified wires the schema through the
+// concurrent rewrite path so apply waits on the right index.
+func TestGenerateIndexRewriteWaitIsSchemaQualified(t *testing.T) {
+	index := &ir.Index{
+		Schema:  "tenant_b",
+		Table:   "items",
+		Name:    "items_sku_idx",
+		Type:    ir.IndexTypeRegular,
+		Method:  "btree",
+		Columns: []*ir.IndexColumn{{Name: "sku"}},
+	}
+	steps := generateIndexRewrite(index)
+	if len(steps) < 2 {
+		t.Fatalf("expected concurrent create + wait steps, got %d", len(steps))
+	}
+	wait := steps[1].SQL
+	if !strings.Contains(wait, "n.nspname = 'tenant_b'") {
+		t.Fatalf("rewrite wait step not schema-qualified:\n%s", wait)
+	}
+	if steps[1].Directive == nil || steps[1].Directive.Type != DirectiveTypeWait {
+		t.Fatalf("expected wait directive on step 1, got %#v", steps[1].Directive)
+	}
+}
+
+// TestGenerateIndexWaitQueryEscapesNames verifies the wait query matches the
+// exact (case-sensitive) schema name and escapes embedded single quotes,
+// instead of relying on a '...'::regnamespace cast that case-folds unquoted
+// names (issue #641).
+func TestGenerateIndexWaitQueryEscapesNames(t *testing.T) {
+	tests := []struct {
+		name       string
+		schema     string
+		index      string
+		wantSchema string
+		wantIndex  string
+	}{
+		{"mixed case schema", "TenantB", "items_sku_idx", "n.nspname = 'TenantB'", "c.relname = 'items_sku_idx'"},
+		{"apostrophe in schema", "o'brien", "items_sku_idx", "n.nspname = 'o''brien'", "c.relname = 'items_sku_idx'"},
+		{"apostrophe in index", "public", "it's_idx", "n.nspname = 'public'", "c.relname = 'it''s_idx'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql := generateIndexWaitQueryWithName(tt.schema, tt.index)
+			if !strings.Contains(sql, tt.wantSchema) {
+				t.Errorf("wait query missing %q:\n%s", tt.wantSchema, sql)
+			}
+			if !strings.Contains(sql, tt.wantIndex) {
+				t.Errorf("wait query missing %q:\n%s", tt.wantIndex, sql)
+			}
+			if strings.Contains(sql, "regnamespace") {
+				t.Errorf("wait query must not cast to regnamespace:\n%s", sql)
+			}
+		})
+	}
+}
