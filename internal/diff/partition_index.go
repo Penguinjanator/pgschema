@@ -109,6 +109,24 @@ type partitionIndexCreationPlan struct {
 	indexes      map[ir.IndexRef]*ir.Index
 	children     map[ir.IndexRef]map[ir.IndexRef]bool
 	uniqueTables map[string]bool
+	// constraints holds, per table key, the PRIMARY KEY and UNIQUE constraints
+	// added after every partition exists instead of inline with CREATE TABLE.
+	// PARTITION OF copies an inline constraint onto the new partition under a
+	// generated name, which can take the name of a standalone index created
+	// later (issue #653). Explicit ALTER TABLE ONLY ... ADD CONSTRAINT
+	// statements reproduce the catalog names instead.
+	constraints map[string]map[string]bool
+	// partitions lists the added partitions of each table key, in name order.
+	partitions map[string][]*ir.Table
+	tables     map[string]*ir.Table
+	// roots maps each table of a hierarchy with postponed constraints to the
+	// hierarchy's root key, so the whole hierarchy is created in one batch.
+	roots map[string]string
+	// created and emitted track creation progress so each constraint family
+	// is added as soon as its last partition exists, ahead of SQL functions
+	// whose bodies depend on the key.
+	created map[string]bool
+	emitted map[string]map[string]bool
 }
 
 func planPartitionIndexCreation(addedTables []*ir.Table, desiredTables map[string]*ir.Table, dump bool) *partitionIndexCreationPlan {
@@ -116,6 +134,11 @@ func planPartitionIndexCreation(addedTables []*ir.Table, desiredTables map[strin
 		indexes:      make(map[ir.IndexRef]*ir.Index),
 		children:     make(map[ir.IndexRef]map[ir.IndexRef]bool),
 		uniqueTables: make(map[string]bool),
+		constraints:  make(map[string]map[string]bool),
+		partitions:   make(map[string][]*ir.Table),
+		roots:        make(map[string]string),
+		created:      make(map[string]bool),
+		emitted:      make(map[string]map[string]bool),
 	}
 	added := make(map[string]*ir.Table)
 	available := availablePartitionIndexes(addedTables)
@@ -127,6 +150,26 @@ func planPartitionIndexCreation(addedTables []*ir.Table, desiredTables map[strin
 				indexes[ir.IndexRef{Schema: index.Schema, Name: index.Name}] = index
 			}
 		}
+	}
+	plan.tables = added
+	for _, table := range addedTables {
+		if table.PartitionOf == "" {
+			continue
+		}
+		parentSchema := table.PartitionOfSchema
+		if parentSchema == "" {
+			parentSchema = table.Schema
+		}
+		parentKey := parentSchema + "." + table.PartitionOf
+		plan.partitions[parentKey] = append(plan.partitions[parentKey], table)
+	}
+	for _, partitions := range plan.partitions {
+		sort.Slice(partitions, func(i, j int) bool {
+			if partitions[i].Schema != partitions[j].Schema {
+				return partitions[i].Schema < partitions[j].Schema
+			}
+			return partitions[i].Name < partitions[j].Name
+		})
 	}
 
 	roots := make(map[string]string)
@@ -174,6 +217,46 @@ func planPartitionIndexCreation(addedTables []*ir.Table, desiredTables map[strin
 				}
 			}
 		}
+		// A constraint is postponed only when every partition copy's catalog
+		// name is known; otherwise inline creation remains the fallback.
+		if len(plan.partitions[key]) == 0 {
+			continue
+		}
+		for _, name := range sortedKeys(table.Constraints) {
+			constraint := table.Constraints[name]
+			if constraint.Type != ir.ConstraintTypePrimaryKey && constraint.Type != ir.ConstraintTypeUnique {
+				continue
+			}
+			if !plan.inheritedNamesKnown(table, name) {
+				continue
+			}
+			if plan.constraints[key] == nil {
+				plan.constraints[key] = make(map[string]bool)
+			}
+			plan.constraints[key][name] = true
+			// Foreign keys referencing the table or any of its partitions wait
+			// for the postponed constraints.
+			plan.markUniqueTables(table)
+		}
+	}
+	for key := range plan.constraints {
+		root := key
+		for {
+			table := added[root]
+			if table == nil || table.PartitionOf == "" {
+				break
+			}
+			parentSchema := table.PartitionOfSchema
+			if parentSchema == "" {
+				parentSchema = table.Schema
+			}
+			parentKey := parentSchema + "." + table.PartitionOf
+			if added[parentKey] == nil {
+				break
+			}
+			root = parentKey
+		}
+		plan.markHierarchy(added[root], root)
 	}
 	for parent, index := range plan.indexes {
 		plan.children[parent] = make(map[ir.IndexRef]bool)
@@ -215,6 +298,153 @@ func partitionHierarchyRoot(table *ir.Table, tables map[string]*ir.Table) string
 
 func (p *partitionIndexCreationPlan) contains(index *ir.Index) bool {
 	return p != nil && p.indexes[ir.IndexRef{Schema: index.Schema, Name: index.Name}] != nil
+}
+
+// inheritedNamesKnown reports whether every partition below table, at any
+// depth, records the catalog name of its copy of the named constraint.
+func (p *partitionIndexCreationPlan) inheritedNamesKnown(table *ir.Table, constraintName string) bool {
+	for _, child := range p.partitions[table.Schema+"."+table.Name] {
+		childName := child.InheritedConstraints[constraintName]
+		if childName == "" || !p.inheritedNamesKnown(child, childName) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *partitionIndexCreationPlan) markHierarchy(table *ir.Table, root string) {
+	key := table.Schema + "." + table.Name
+	p.roots[key] = root
+	for _, child := range p.partitions[key] {
+		p.markHierarchy(child, root)
+	}
+}
+
+// hierarchyRoot returns the root key of a hierarchy with postponed
+// constraints, or "" for any other table.
+func (p *partitionIndexCreationPlan) hierarchyRoot(table *ir.Table) string {
+	if p == nil {
+		return ""
+	}
+	return p.roots[table.Schema+"."+table.Name]
+}
+
+func (p *partitionIndexCreationPlan) markUniqueTables(table *ir.Table) {
+	key := table.Schema + "." + table.Name
+	p.uniqueTables[key] = true
+	for _, child := range p.partitions[key] {
+		p.markUniqueTables(child)
+	}
+}
+
+// defersConstraint reports whether the constraint is added after the
+// partitions exist rather than inline with its table.
+func (p *partitionIndexCreationPlan) defersConstraint(table *ir.Table, constraint *ir.Constraint) bool {
+	if p == nil || table == nil || constraint == nil {
+		return false
+	}
+	return p.constraints[table.Schema+"."+table.Name][constraint.Name]
+}
+
+// tableCreated records that the table's CREATE TABLE was emitted and adds the
+// postponed constraints of every family that is now complete. Emitting them
+// here, inside the table batch, keeps them ahead of SQL functions created
+// after the batch whose bodies depend on the key (ON CONFLICT ON CONSTRAINT,
+// GROUP BY functional dependency).
+func (p *partitionIndexCreationPlan) tableCreated(table *ir.Table, targetSchema string, collector *diffCollector) {
+	if p == nil {
+		return
+	}
+	p.created[table.Schema+"."+table.Name] = true
+	if p.hierarchyRoot(table) == "" {
+		return
+	}
+	p.generateReadyConstraintSQL(targetSchema, collector, false)
+}
+
+// generateDeferredConstraintSQL adds any postponed constraint family not yet
+// emitted by tableCreated.
+func (p *partitionIndexCreationPlan) generateDeferredConstraintSQL(targetSchema string, collector *diffCollector) {
+	if p == nil {
+		return
+	}
+	p.generateReadyConstraintSQL(targetSchema, collector, true)
+}
+
+// generateReadyConstraintSQL adds the postponed PRIMARY KEY and UNIQUE
+// constraints of each family whose table and partitions all exist (or of every
+// remaining family when flush is set). ONLY keeps PostgreSQL from creating
+// partition copies under generated names; each copy is added under its catalog
+// name and attached explicitly. One step carries the whole family so the
+// statements stay together in plans and multi-file dumps.
+func (p *partitionIndexCreationPlan) generateReadyConstraintSQL(targetSchema string, collector *diffCollector, flush bool) {
+	keys := make([]string, 0, len(p.constraints))
+	for key := range p.constraints {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		table := p.tables[key]
+		if !flush && !p.hierarchyCreated(table) {
+			continue
+		}
+		for _, name := range sortedKeys(p.constraints[key]) {
+			if p.emitted[key][name] {
+				continue
+			}
+			if p.emitted[key] == nil {
+				p.emitted[key] = make(map[string]bool)
+			}
+			p.emitted[key][name] = true
+			constraint := table.Constraints[name]
+			var statements []SQLStatement
+			p.appendConstraintFamily(&statements, table, constraint, targetSchema, collector.qualifySchema)
+			collector.collectStatements(&diffContext{
+				Type: DiffTypeTableConstraint, Operation: DiffOperationCreate,
+				Path:   fmt.Sprintf("%s.%s.%s", table.Schema, table.Name, constraint.Name),
+				Source: constraint, CanRunInTransaction: true,
+			}, statements)
+		}
+	}
+}
+
+// hierarchyCreated reports whether the table and every partition below it
+// have been created.
+func (p *partitionIndexCreationPlan) hierarchyCreated(table *ir.Table) bool {
+	key := table.Schema + "." + table.Name
+	if !p.created[key] {
+		return false
+	}
+	for _, child := range p.partitions[key] {
+		if !p.hierarchyCreated(child) {
+			return false
+		}
+	}
+	return true
+}
+
+// appendConstraintFamily adds the constraint to its table with ONLY, then each
+// partition's copy under its recorded name, attaching every copy to the
+// constraint's index. Nested partitions attach to their immediate parent.
+func (p *partitionIndexCreationPlan) appendConstraintFamily(statements *[]SQLStatement, table *ir.Table, constraint *ir.Constraint, targetSchema string, qualifySchema bool) {
+	tableName := qualifyEntityNameMode(table.Schema, table.Name, targetSchema, qualifySchema)
+	*statements = append(*statements, SQLStatement{
+		SQL:                 fmt.Sprintf("ALTER TABLE ONLY %s ADD %s;", tableName, generateConstraintSQL(constraint, targetSchema, qualifySchema)),
+		CanRunInTransaction: true,
+	})
+	for _, child := range p.partitions[table.Schema+"."+table.Name] {
+		childConstraint := *constraint
+		childConstraint.Schema = child.Schema
+		childConstraint.Table = child.Name
+		childConstraint.Name = child.InheritedConstraints[constraint.Name]
+		p.appendConstraintFamily(statements, child, &childConstraint, targetSchema, qualifySchema)
+		*statements = append(*statements, SQLStatement{
+			SQL: fmt.Sprintf("ALTER INDEX %s ATTACH PARTITION %s;",
+				qualifyEntityNameMode(table.Schema, constraint.Name, targetSchema, qualifySchema),
+				qualifyEntityNameMode(child.Schema, childConstraint.Name, targetSchema, qualifySchema)),
+			CanRunInTransaction: true,
+		})
+	}
 }
 
 func (p *partitionIndexCreationPlan) defersForeignKey(table *ir.Table, constraint *ir.Constraint) bool {

@@ -78,6 +78,39 @@ ALTER INDEX archive_unique ATTACH PARTITION archive_local_unique;
 CREATE TABLE archive_links (bucket int, label text, FOREIGN KEY (bucket, label) REFERENCES archive_events (bucket, label));
 COMMENT ON INDEX event_lookup IS 'Parent lookup';
 COMMENT ON INDEX early_custom_lookup IS 'Named child lookup';
+-- Inherited constraint indexes keep their catalog names even when a standalone
+-- index already holds the generated name (issue #653).
+CREATE TABLE keyed_events (bucket int NOT NULL, id int NOT NULL, note text,
+    PRIMARY KEY (bucket, id), CONSTRAINT keyed_events_note_key UNIQUE (bucket, id, note)) PARTITION BY RANGE (bucket);
+CREATE INDEX keyed_events_early_pkey ON keyed_events (id);
+CREATE TABLE keyed_events_early PARTITION OF keyed_events FOR VALUES FROM (0) TO (10);
+CREATE TABLE keyed_events_late PARTITION OF keyed_events FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (bucket);
+CREATE TABLE keyed_events_late_a PARTITION OF keyed_events_late FOR VALUES FROM (10) TO (15);
+ALTER INDEX keyed_events_late_a_pkey RENAME TO keyed_late_a_pk;
+CREATE INDEX keyed_events_late_a_pkey ON keyed_events_late_a (note);
+CREATE TABLE keyed_links (bucket int, id int, FOREIGN KEY (bucket, id) REFERENCES keyed_events (bucket, id));
+-- A SQL-standard body is validated at creation, so the key must already exist.
+CREATE FUNCTION upsert_keyed_event(p_bucket int, p_id int) RETURNS void LANGUAGE sql BEGIN ATOMIC
+    INSERT INTO keyed_events (bucket, id) VALUES (p_bucket, p_id) ON CONFLICT ON CONSTRAINT keyed_events_pkey DO NOTHING;
+END;
+-- A partition default calling a function that reads the parent keeps the
+-- parent, the function and the partition in that order.
+CREATE FUNCTION count_keyed_events() RETURNS text LANGUAGE sql BEGIN ATOMIC
+    SELECT count(*)::text FROM keyed_events;
+END;
+CREATE FUNCTION count_keyed_events_text() RETURNS text LANGUAGE sql BEGIN ATOMIC
+    SELECT count_keyed_events();
+END;
+CREATE TABLE keyed_events_rest PARTITION OF keyed_events (note DEFAULT count_keyed_events_text()) DEFAULT;
+CREATE PROCEDURE upsert_keyed_event_proc(p_bucket int, p_id int) LANGUAGE sql BEGIN ATOMIC
+    INSERT INTO keyed_events (bucket, id) VALUES (p_bucket, p_id) ON CONFLICT ON CONSTRAINT keyed_events_pkey DO NOTHING;
+END;
+-- A policy expression relying on the key follows the postponed constraints,
+-- on the keyed table and on a table that references it.
+ALTER TABLE keyed_events ENABLE ROW LEVEL SECURITY;
+CREATE POLICY keyed_events_grouped ON keyed_events USING (EXISTS (SELECT note FROM keyed_events GROUP BY bucket, id));
+ALTER TABLE keyed_links ENABLE ROW LEVEL SECURITY;
+CREATE POLICY keyed_links_grouped ON keyed_links USING (EXISTS (SELECT note FROM keyed_events GROUP BY bucket, id));
 `
 	for _, constraintType := range []string{"UNIQUE", "PRIMARY KEY"} {
 		for _, multiFile := range []bool{false, true} {
