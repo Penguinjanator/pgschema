@@ -41,6 +41,9 @@ func normalizeSchema(schema *Schema) {
 	// Mark SERIAL columns once column defaults and sequences are normalized
 	markSerialColumns(schema)
 
+	// Identity on a partition belongs to its parent
+	stripInheritedIdentity(schema)
+
 	// Normalize views
 	for _, view := range schema.Views {
 		normalizeView(view)
@@ -1817,4 +1820,42 @@ func findArrayClose(expr string, startIdx int) int {
 	}
 
 	return -1 // Not found
+}
+
+// stripInheritedIdentity removes the identity marker from partition columns
+// that inherit it from their parent (PG17+ propagates attidentity to every
+// partition). The identity is the parent's: DETACH PARTITION strips it from
+// the child and ATTACH PARTITION rejects a child that carries one of its own,
+// so a plan that attaches a standalone table must not add it first. Parents
+// outside the schema are not visible here and are left alone. (#639)
+//
+// Which columns carry identity is read for every table before any is cleared:
+// in a root → partition → sub-partition hierarchy the middle table is both a
+// child and a parent, and clearing it first would hide the identity its own
+// partitions inherit, so the result would depend on map iteration order.
+func stripInheritedIdentity(schema *Schema) {
+	identity := make(map[string]map[string]bool, len(schema.Tables))
+	for name, table := range schema.Tables {
+		columns := make(map[string]bool)
+		for _, column := range table.Columns {
+			if column.Identity != nil {
+				columns[column.Name] = true
+			}
+		}
+		identity[name] = columns
+	}
+	for _, table := range schema.Tables {
+		if table.PartitionOf == "" || (table.PartitionOfSchema != "" && table.PartitionOfSchema != schema.Name) {
+			continue
+		}
+		parentIdentity, visible := identity[table.PartitionOf]
+		if !visible {
+			continue
+		}
+		for _, column := range table.Columns {
+			if parentIdentity[column.Name] {
+				column.Identity = nil
+			}
+		}
+	}
 }

@@ -418,6 +418,9 @@ func diffTables(oldTable, newTable *ir.Table, targetSchema string, targetMajorVe
 		diff.PersistenceChanged = true
 	}
 
+	// Check for partition parent or bound changes (#639)
+	diffPartition(diff, oldTable, newTable)
+
 	// Return nil if no changes
 	if len(diff.AddedColumns) == 0 && len(diff.DroppedColumns) == 0 &&
 		len(diff.ModifiedColumns) == 0 && len(diff.AddedConstraints) == 0 &&
@@ -427,7 +430,7 @@ func diffTables(oldTable, newTable *ir.Table, targetSchema string, targetMajorVe
 		len(diff.DroppedTriggers) == 0 && len(diff.ModifiedTriggers) == 0 &&
 		len(diff.AddedPolicies) == 0 && len(diff.DroppedPolicies) == 0 &&
 		len(diff.ModifiedPolicies) == 0 && len(diff.RLSChanges) == 0 &&
-		!diff.CommentChanged && !diff.PersistenceChanged {
+		!diff.CommentChanged && !diff.PersistenceChanged && !diff.PartitionChanged {
 		return nil
 	}
 
@@ -733,7 +736,47 @@ func planFKRecreationForReplacedConstraints(modifiedTables []*tableDiff, addedTa
 		}
 	}
 
-	if len(replaced) == 0 && len(replacedUniqueIndexes) == 0 && len(addedConstraints) == 0 && len(addedUniqueIndexes) == 0 {
+	// Unique/PK constraints a table gains by being attached as a partition: the
+	// copies of its new parent's keys exist only once ATTACH PARTITION has run,
+	// after the table modifications, so FKs that reference the table through
+	// them wait for the attach the same way (#639). When the attached table is
+	// itself partitioned, ATTACH creates the copies on its partitions too, at
+	// any depth, so they gain the same keys.
+	keysFromAttach := make(map[string][]*ir.Constraint)
+	for _, td := range modifiedTables {
+		if !td.PartitionChanged || td.Table.PartitionOf == "" {
+			continue
+		}
+		parent := newTables[partitionParentKey(td.Table)]
+		if parent == nil {
+			continue
+		}
+		key := td.Table.Schema + "." + td.Table.Name
+		for _, c := range effectiveConstraints(newTables, parent) {
+			if c.Type == ir.ConstraintTypeUnique || c.Type == ir.ConstraintTypePrimaryKey {
+				keysFromAttach[key] = append(keysFromAttach[key], c)
+			}
+		}
+	}
+	attachedKeys := make(map[string][]*ir.Constraint, len(keysFromAttach))
+	for key, keys := range keysFromAttach {
+		attachedKeys[key] = keys
+	}
+	for _, tableKey := range sortedKeys(newTables) {
+		if _, attached := attachedKeys[tableKey]; attached {
+			continue
+		}
+		for ancestor := newTables[tableKey]; ancestor != nil && ancestor.PartitionOf != ""; {
+			ancestorKey := partitionParentKey(ancestor)
+			if keys, ok := attachedKeys[ancestorKey]; ok {
+				keysFromAttach[tableKey] = append(keysFromAttach[tableKey], keys...)
+				break
+			}
+			ancestor = newTables[ancestorKey]
+		}
+	}
+
+	if len(replaced) == 0 && len(replacedUniqueIndexes) == 0 && len(addedConstraints) == 0 && len(addedUniqueIndexes) == 0 && len(keysFromAttach) == 0 {
 		return nil, nil, nil
 	}
 
@@ -752,13 +795,15 @@ func planFKRecreationForReplacedConstraints(modifiedTables []*tableDiff, addedTa
 			newFK := newTable.Constraints[name]
 			oldBound := fkReferencesAnyConstraint(fk, replaced[fkReferencedTableKey(fk)]) ||
 				fkReferencesAnyUniqueIndex(fk, replacedUniqueIndexes[fkReferencedTableKey(fk)])
-			// A changed FK whose new definition targets a replaced constraint
-			// must also wait for the replacement, even if its old definition
-			// was bound elsewhere.
+			// A changed FK whose new definition targets a replaced constraint,
+			// or a key its referenced table only gains by being attached as a
+			// partition (#639), must also wait for it, even if its old
+			// definition was bound elsewhere.
 			newBound := newFK != nil && !constraintsEqual(fk, newFK) &&
 				(fkReferencesAnyConstraint(newFK, replaced[fkReferencedTableKey(newFK)]) ||
 					fkReferencesAnyUniqueIndex(newFK, replacedUniqueIndexes[fkReferencedTableKey(newFK)]) ||
-					fkReferencesAnyUniqueIndex(newFK, addedUniqueIndexes[fkReferencedTableKey(newFK)]))
+					fkReferencesAnyUniqueIndex(newFK, addedUniqueIndexes[fkReferencedTableKey(newFK)]) ||
+					fkReferencesAnyConstraint(newFK, keysFromAttach[fkReferencedTableKey(newFK)]))
 			if !oldBound && !newBound {
 				continue
 			}
@@ -784,7 +829,8 @@ func planFKRecreationForReplacedConstraints(modifiedTables []*tableDiff, addedTa
 			if !fkReferencesAnyConstraint(fk, replaced[refKey]) &&
 				!fkReferencesAnyUniqueIndex(fk, replacedUniqueIndexes[refKey]) &&
 				!fkReferencesAnyConstraint(fk, addedConstraints[refKey]) &&
-				!fkReferencesAnyUniqueIndex(fk, addedUniqueIndexes[refKey]) {
+				!fkReferencesAnyUniqueIndex(fk, addedUniqueIndexes[refKey]) &&
+				!fkReferencesAnyConstraint(fk, keysFromAttach[refKey]) {
 				continue
 			}
 			suppressedInlineFKs[constraintPathKey(fk)] = true
@@ -796,7 +842,8 @@ func planFKRecreationForReplacedConstraints(modifiedTables []*tableDiff, addedTa
 	// migration creates, whether rebuilt with a re-created column or new: the
 	// ALTER TABLE ... ADD CONSTRAINT would run before the index exists
 	// (always for a self-reference, and depending on table order otherwise),
-	// so they are deferred the same way. (#591, #506)
+	// so they are deferred the same way (#591, #506); likewise FKs that target
+	// a key the referenced table only gains by being attached (#639).
 	for _, td := range modifiedTables {
 		for _, fk := range td.AddedConstraints {
 			if fk.Type != ir.ConstraintTypeForeignKey {
@@ -804,7 +851,8 @@ func planFKRecreationForReplacedConstraints(modifiedTables []*tableDiff, addedTa
 			}
 			refKey := fkReferencedTableKey(fk)
 			if !fkReferencesAnyUniqueIndex(fk, replacedUniqueIndexes[refKey]) &&
-				!fkReferencesAnyUniqueIndex(fk, addedUniqueIndexes[refKey]) {
+				!fkReferencesAnyUniqueIndex(fk, addedUniqueIndexes[refKey]) &&
+				!fkReferencesAnyConstraint(fk, keysFromAttach[refKey]) {
 				continue
 			}
 			suppressedInlineFKs[constraintPathKey(fk)] = true
